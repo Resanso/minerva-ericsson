@@ -1,0 +1,13 @@
+{
+  "name": "minerva-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "pnpm --filter minerva dev",
+    "build": "pnpm --filter minerva build",
+    "start": "pnpm --filter minerva start"
+  }
+}
