@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
@@ -55,6 +56,15 @@ type Client struct {
 	client influxdb2.Client
 }
 
+// SensorReading represents a single measurement row returned from InfluxDB.
+type SensorReading struct {
+	Time        time.Time
+	MachineName string
+	SensorName  string
+	Status      string
+	Value       float64
+}
+
 // New establishes a new InfluxDB client based on the provided configuration.
 // A ping is issued to ensure the connection is healthy before returning.
 func New(ctx context.Context, cfg Config) (*Client, error) {
@@ -90,6 +100,84 @@ func (c *Client) QueryAPI() api.QueryAPI {
 	return c.client.QueryAPI(c.cfg.Org)
 }
 
+// Config exposes the immutable client configuration.
+func (c *Client) Config() Config {
+	return c.cfg
+}
+
+// RecentSensorReadings fetches the newest sensor values within the provided lookback window.
+func (c *Client) RecentSensorReadings(ctx context.Context, measurement string, lookback time.Duration, limit int) ([]SensorReading, error) {
+	return c.recentSensorReadings(ctx, measurement, nil, lookback, limit)
+}
+
+// RecentSensorReadingsByMachine fetches filtered data for a specific machine tag.
+func (c *Client) RecentSensorReadingsByMachine(ctx context.Context, measurement, machineName string, lookback time.Duration, limit int) ([]SensorReading, error) {
+	if strings.TrimSpace(machineName) == "" {
+		return nil, fmt.Errorf("machine name is required")
+	}
+	f := map[string]string{"machine_name": machineName}
+	return c.recentSensorReadings(ctx, measurement, f, lookback, limit)
+}
+
+func (c *Client) recentSensorReadings(ctx context.Context, measurement string, filters map[string]string, lookback time.Duration, limit int) ([]SensorReading, error) {
+	if measurement == "" {
+		return nil, fmt.Errorf("measurement is required")
+	}
+	if lookback <= 0 {
+		lookback = time.Hour
+	}
+
+	flux := fmt.Sprintf(`from(bucket: %q)
+|> range(start: -%s)
+|> filter(fn: (r) => r["_measurement"] == %q)
+|> filter(fn: (r) => r["_field"] == "value")`, c.cfg.Bucket, toFluxDuration(lookback), measurement)
+
+	for key, value := range filters {
+		flux = fmt.Sprintf("%s\n|> filter(fn: (r) => r[%q] == %s)", flux, key, fluxStringLiteral(value))
+	}
+
+	flux += "\n|> sort(columns: [\"_time\"], desc: true)"
+	if limit > 0 {
+		flux = fmt.Sprintf("%s\n|> limit(n:%d)", flux, limit)
+	}
+
+	result, err := c.QueryAPI().Query(ctx, flux)
+	if err != nil {
+		return nil, fmt.Errorf("query influx: %w", err)
+	}
+	defer result.Close()
+
+	readings := make([]SensorReading, 0, max(limit, 0))
+	for result.Next() {
+		record := result.Record()
+		value, ok := record.Value().(float64)
+		if !ok {
+			switch v := record.Value().(type) {
+			case int64:
+				value = float64(v)
+			case uint64:
+				value = float64(v)
+			default:
+				continue
+			}
+		}
+
+		readings = append(readings, SensorReading{
+			Time:        record.Time(),
+			MachineName: stringify(record.ValueByKey("machine_name")),
+			SensorName:  stringify(record.ValueByKey("sensor_name")),
+			Status:      stringify(record.ValueByKey("status")),
+			Value:       value,
+		})
+	}
+
+	if err := result.Err(); err != nil {
+		return nil, fmt.Errorf("iterate influx result: %w", err)
+	}
+
+	return readings, nil
+}
+
 // Ping checks the InfluxDB availability using the wrapped client.
 func (c *Client) Ping(ctx context.Context) error {
 	ok, err := c.client.Ping(ctx)
@@ -105,4 +193,41 @@ func (c *Client) Ping(ctx context.Context) error {
 // Close releases resources held by the underlying client.
 func (c *Client) Close() {
 	c.client.Close()
+}
+
+func toFluxDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	d = d.Truncate(time.Second)
+	if d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int64(d/time.Hour))
+	}
+	if d%time.Minute == 0 {
+		return fmt.Sprintf("%dm", int64(d/time.Minute))
+	}
+	if d%time.Second == 0 {
+		return fmt.Sprintf("%ds", int64(d/time.Second))
+	}
+	return fmt.Sprintf("%dns", d.Nanoseconds())
+}
+
+func stringify(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprint(v)
+}
+
+func fluxStringLiteral(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	return fmt.Sprintf("\"%s\"", s)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
