@@ -70,6 +70,7 @@ func (r *Repository) ensureLotsTable(ctx context.Context) error {
 		good_product INT NULL,
 		defect_product INT NULL,
 		conclusion TEXT NULL,
+		is_conclusion BOOLEAN NOT NULL DEFAULT FALSE,
 		INDEX idx_lots_status (status),
 		INDEX idx_lots_machine (machine_name)
 	)`
@@ -85,6 +86,7 @@ func (r *Repository) ensureLotsTable(ctx context.Context) error {
 		`ALTER TABLE lots ADD COLUMN good_product INT NULL AFTER operation_hour`,
 		`ALTER TABLE lots ADD COLUMN defect_product INT NULL AFTER good_product`,
 		`ALTER TABLE lots ADD COLUMN conclusion TEXT NULL AFTER defect_product`,
+		`ALTER TABLE lots ADD COLUMN is_conclusion BOOLEAN NOT NULL DEFAULT FALSE AFTER conclusion`,
 	}
 	for _, stmt := range alterStatements {
 		if _, err := r.db.ExecContext(ctx, stmt); err != nil {

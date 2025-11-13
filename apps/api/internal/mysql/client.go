@@ -209,3 +209,50 @@ func parseDuration(raw string, fallback time.Duration) time.Duration {
 	}
 	return dur
 }
+
+// FetchRows executes the provided query and returns the result set as a slice of column maps.
+func FetchRows(ctx context.Context, db *sql.DB, query string, args ...any) ([]map[string]any, error) {
+	if db == nil {
+		return nil, errors.New("mysql fetch: nil db handle")
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]map[string]any, 0)
+	values := make([]any, len(columns))
+	valuePtrs := make([]any, len(columns))
+
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	for rows.Next() {
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]any, len(columns))
+		for i, col := range columns {
+			switch v := values[i].(type) {
+			case []byte:
+				row[col] = string(v)
+			default:
+				row[col] = v
+			}
+		}
+		results = append(results, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return results, nil
+}

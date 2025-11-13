@@ -12,21 +12,33 @@ import (
 )
 
 const (
-	defaultInterval   = 1 * time.Minute
-	measurementName   = "sensor_data"
-	rebindCoefficient = 0.1
-	downCoefficient   = 0.25
-	downNoiseScale    = 0.1
-	defaultDownRatio  = 0.0
-	minDownFraction   = 0.02
+	defaultInterval        = 1 * time.Second
+	measurementName        = "sensor_data"
+	rebindCoefficient      = 0.1
+	downCoefficient        = 0.25
+	downNoiseScale         = 0.1
+	defaultDownRatio       = 0.0
+	minDownFraction        = 0.02
+	startupInitialRatio    = 0.2
+	startupRampCoefficient = 0.4
+	startupNoiseScale      = 0.05
+	shutdownCoefficient    = 0.35
+	shutdownNoiseScale     = 0.05
 )
 
 type sensorState int
 
 const (
-	stateRunning sensorState = iota
+	stateStartup sensorState = iota
+	stateRunning
+	stateShuttingDown
 	stateDown
 )
+
+// CycleListener observes when the simulator finishes iterating across all machines once.
+type CycleListener interface {
+	OnCycleComplete(ctx context.Context, completedAt time.Time, lastMachine string)
+}
 
 type durationRange struct {
 	min int
@@ -34,8 +46,10 @@ type durationRange struct {
 }
 
 var (
-	defaultRunRange  = durationRange{min: 6, max: 24}
-	defaultDownRange = durationRange{min: 6, max: 14}
+	defaultStartupRange  = durationRange{min: 3, max: 6}
+	defaultRunRange      = durationRange{min: 6, max: 24}
+	defaultShutdownRange = durationRange{min: 3, max: 6}
+	defaultDownRange     = durationRange{min: 6, max: 14}
 )
 
 // Sensor describes a simulated sensor configuration with downtime behaviour.
@@ -50,18 +64,27 @@ type Sensor struct {
 
 	state          sensorState
 	ticksRemaining int
+	startupRange   durationRange
 	runRange       durationRange
+	shutdownRange  durationRange
 	downRange      durationRange
 	downTarget     float64
 }
 
 // Simulator generates time-series data for configured sensors.
 type Simulator struct {
-	writer   api.WriteAPIBlocking
-	sensors  []*Sensor
-	mu       sync.RWMutex
-	rng      *rand.Rand
-	interval time.Duration
+	writer            api.WriteAPIBlocking
+	sensors           []*Sensor
+	machineSensors    map[string][]*Sensor
+	machineOrder      []string
+	machineIndex      int
+	machineIteration  int
+	machineIterations int
+	enabled           bool
+	cycleListeners    []CycleListener
+	mu                sync.RWMutex
+	rng               *rand.Rand
+	interval          time.Duration
 }
 
 // Option customizes Simulator creation.
@@ -76,13 +99,25 @@ func WithInterval(interval time.Duration) Option {
 	}
 }
 
+// WithMachineIterations overrides how many ticks a machine should remain active
+// before advancing to the next machine in the sequence.
+func WithMachineIterations(iterations int) Option {
+	return func(s *Simulator) {
+		if iterations > 0 {
+			s.machineIterations = iterations
+		}
+	}
+}
+
 // New creates a new Simulator.
 func New(writer api.WriteAPIBlocking, sensors []*Sensor, opts ...Option) *Simulator {
 	sim := &Simulator{
-		writer:   writer,
-		sensors:  sensors,
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
-		interval: defaultInterval,
+		writer:            writer,
+		sensors:           sensors,
+		machineSensors:    make(map[string][]*Sensor),
+		machineIterations: MachineIterationsFromEnv(),
+		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
+		interval:          defaultInterval,
 	}
 	for _, opt := range opts {
 		opt(sim)
@@ -111,14 +146,32 @@ func (s *Simulator) Start(ctx context.Context) {
 
 func (s *Simulator) tick(ctx context.Context, ts time.Time) {
 	s.mu.Lock()
-	readings := make([]Sensor, len(s.sensors))
-	for i, sensor := range s.sensors {
+	if !s.enabled || len(s.machineOrder) == 0 {
+		s.mu.Unlock()
+		return
+	}
+
+	currentMachine := s.machineOrder[s.machineIndex]
+	activeSensors := s.machineSensors[currentMachine]
+	readings := make([]Sensor, len(activeSensors))
+	for i, sensor := range activeSensors {
 		value := s.nextValue(sensor)
 		readings[i] = Sensor{
 			MachineName:  sensor.MachineName,
 			SensorName:   sensor.SensorName,
 			CurrentValue: value,
 			Status:       sensor.Status,
+		}
+	}
+
+	cycleComplete := false
+	lastMachine := currentMachine
+	s.machineIteration++
+	if s.machineIteration >= s.machineIterations {
+		s.machineIteration = 0
+		s.machineIndex = (s.machineIndex + 1) % len(s.machineOrder)
+		if s.machineIndex == 0 {
+			cycleComplete = true
 		}
 	}
 	s.mu.Unlock()
@@ -141,25 +194,41 @@ func (s *Simulator) tick(ctx context.Context, ts time.Time) {
 		}
 		log.Printf("sensor simulated: machine=%s sensor=%s status=%s value=%.2f", reading.MachineName, reading.SensorName, reading.Status, reading.CurrentValue)
 	}
+
+	if cycleComplete {
+		s.notifyCycleComplete(ctx, ts, lastMachine)
+	}
 }
 
 func (s *Simulator) nextValue(sensor *Sensor) float64 {
 	if sensor.ticksRemaining <= 0 {
-		if sensor.state == stateRunning {
-			s.enterState(sensor, stateDown)
-		} else {
+		switch sensor.state {
+		case stateStartup:
 			s.enterState(sensor, stateRunning)
-			sensor.CurrentValue += (sensor.Baseline - sensor.CurrentValue) * 0.2
+		case stateRunning:
+			s.enterState(sensor, stateShuttingDown)
+		case stateShuttingDown:
+			s.enterState(sensor, stateDown)
+		case stateDown:
+			s.enterState(sensor, stateStartup)
 		}
 	}
 
 	sensor.ticksRemaining--
 
 	switch sensor.state {
+	case stateStartup:
+		if sensor.Baseline > 0 {
+			sensor.CurrentValue += (sensor.Baseline - sensor.CurrentValue) * startupRampCoefficient
+		}
+		sensor.CurrentValue += (s.rng.Float64() - 0.5) * sensor.Drift * startupNoiseScale
 	case stateRunning:
 		change := (s.rng.Float64() - 0.5) * sensor.Drift
 		sensor.CurrentValue += change
 		sensor.CurrentValue += (sensor.Baseline - sensor.CurrentValue) * rebindCoefficient
+	case stateShuttingDown:
+		sensor.CurrentValue += (sensor.downTarget - sensor.CurrentValue) * shutdownCoefficient
+		sensor.CurrentValue += (s.rng.Float64() - 0.5) * sensor.Drift * shutdownNoiseScale
 	case stateDown:
 		sensor.CurrentValue += (sensor.downTarget - sensor.CurrentValue) * downCoefficient
 		sensor.CurrentValue += (s.rng.Float64() - 0.5) * sensor.Drift * downNoiseScale
@@ -180,12 +249,35 @@ func (s *Simulator) nextValue(sensor *Sensor) float64 {
 func (s *Simulator) enterState(sensor *Sensor, newState sensorState) {
 	sensor.state = newState
 	switch newState {
+	case stateStartup:
+		sensor.Status = "starting"
+		sensor.ticksRemaining = s.randomTicks(sensor.startupRange)
+		if sensor.Baseline > 0 {
+			base := sensor.Baseline * startupInitialRatio
+			noise := (s.rng.Float64() - 0.5) * sensor.Drift * startupNoiseScale
+			sensor.CurrentValue = base + noise
+			if sensor.CurrentValue < 0 {
+				sensor.CurrentValue = 0
+			}
+			if sensor.CurrentValue > sensor.Baseline {
+				sensor.CurrentValue = sensor.Baseline
+			}
+		}
 	case stateRunning:
 		sensor.Status = "running"
 		sensor.ticksRemaining = s.randomTicks(sensor.runRange)
+		if sensor.Baseline > 0 && sensor.CurrentValue < sensor.Baseline*0.8 {
+			sensor.CurrentValue += (sensor.Baseline - sensor.CurrentValue) * 0.3
+		}
+	case stateShuttingDown:
+		sensor.Status = "shutting_down"
+		sensor.ticksRemaining = s.randomTicks(sensor.shutdownRange)
 	case stateDown:
 		sensor.Status = "down"
 		sensor.ticksRemaining = s.randomTicks(sensor.downRange)
+		if sensor.CurrentValue > sensor.downTarget {
+			sensor.CurrentValue = sensor.downTarget
+		}
 	}
 }
 
@@ -206,9 +298,23 @@ func (s *Simulator) randomTicks(r durationRange) int {
 }
 
 func (s *Simulator) initializeSensors() {
+	s.machineSensors = make(map[string][]*Sensor)
+	s.machineOrder = s.machineOrder[:0]
+	if s.machineIterations <= 0 {
+		s.machineIterations = 1
+	}
+	s.machineIndex = 0
+	s.machineIteration = 0
+
 	for _, sensor := range s.sensors {
+		if sensor.startupRange.min == 0 && sensor.startupRange.max == 0 {
+			sensor.startupRange = defaultStartupRange
+		}
 		if sensor.runRange.min == 0 && sensor.runRange.max == 0 {
 			sensor.runRange = defaultRunRange
+		}
+		if sensor.shutdownRange.min == 0 && sensor.shutdownRange.max == 0 {
+			sensor.shutdownRange = defaultShutdownRange
 		}
 		if sensor.downRange.min == 0 && sensor.downRange.max == 0 {
 			sensor.downRange = defaultDownRange
@@ -216,7 +322,68 @@ func (s *Simulator) initializeSensors() {
 		if sensor.downTarget == 0 && sensor.Baseline > 0 {
 			sensor.downTarget = sensor.Baseline * defaultDownRatio
 		}
-		s.enterState(sensor, stateRunning)
+
+		s.enterState(sensor, stateStartup)
+
+		if _, exists := s.machineSensors[sensor.MachineName]; !exists {
+			s.machineOrder = append(s.machineOrder, sensor.MachineName)
+		}
+		s.machineSensors[sensor.MachineName] = append(s.machineSensors[sensor.MachineName], sensor)
+	}
+}
+
+// Enable activates the simulator and resets sensor state.
+func (s *Simulator) Enable() {
+	s.mu.Lock()
+	if s.enabled {
+		s.mu.Unlock()
+		return
+	}
+	s.initializeSensors()
+	s.enabled = true
+	machines := len(s.machineOrder)
+	iters := s.machineIterations
+	s.mu.Unlock()
+	log.Printf("sensor simulator enabled; machines=%d iterationsPerMachine=%d", machines, iters)
+}
+
+// Disable pauses all sensor generation.
+func (s *Simulator) Disable() {
+	s.mu.Lock()
+	if !s.enabled {
+		s.mu.Unlock()
+		return
+	}
+	s.enabled = false
+	s.machineIndex = 0
+	s.machineIteration = 0
+	s.mu.Unlock()
+	log.Println("sensor simulator disabled")
+}
+
+// Enabled reports whether the simulator is currently generating data.
+func (s *Simulator) Enabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.enabled
+}
+
+// RegisterCycleListener subscribes to cycle completion events.
+func (s *Simulator) RegisterCycleListener(listener CycleListener) {
+	if listener == nil {
+		return
+	}
+	s.mu.Lock()
+	s.cycleListeners = append(s.cycleListeners, listener)
+	s.mu.Unlock()
+}
+
+func (s *Simulator) notifyCycleComplete(ctx context.Context, ts time.Time, lastMachine string) {
+	s.mu.RLock()
+	listeners := append([]CycleListener(nil), s.cycleListeners...)
+	s.mu.RUnlock()
+	for _, listener := range listeners {
+		listener.OnCycleComplete(ctx, ts, lastMachine)
 	}
 }
 
@@ -243,15 +410,25 @@ func NewSensor(machine, sensor string, baseline, drift, initialSpread float64) *
 	if downTarget < 0 {
 		downTarget = 0
 	}
+	initialValue := baseline * startupInitialRatio
+	initialValue += (rng.Float64() - 0.5) * initialSpread
+	if initialValue < 0 {
+		initialValue = 0
+	}
+	if baseline > 0 && initialValue > baseline {
+		initialValue = baseline
+	}
 	return &Sensor{
-		MachineName:  machine,
-		SensorName:   sensor,
-		Baseline:     baseline,
-		Drift:        drift,
-		CurrentValue: baseline + (rng.Float64()-0.5)*initialSpread,
-		runRange:     defaultRunRange,
-		downRange:    defaultDownRange,
-		downTarget:   downTarget,
+		MachineName:   machine,
+		SensorName:    sensor,
+		Baseline:      baseline,
+		Drift:         drift,
+		CurrentValue:  initialValue,
+		startupRange:  defaultStartupRange,
+		runRange:      defaultRunRange,
+		shutdownRange: defaultShutdownRange,
+		downRange:     defaultDownRange,
+		downTarget:    downTarget,
 	}
 }
 

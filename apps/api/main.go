@@ -13,7 +13,6 @@ import (
 	"github.com/Resanso/minerva-ericsson/apps/api/internal/llm"
 	"github.com/Resanso/minerva-ericsson/apps/api/internal/metadata"
 	mysqlclient "github.com/Resanso/minerva-ericsson/apps/api/internal/mysql"
-	"github.com/Resanso/minerva-ericsson/apps/api/internal/processing"
 	"github.com/Resanso/minerva-ericsson/apps/api/internal/server"
 	"github.com/Resanso/minerva-ericsson/apps/api/internal/simulation"
 )
@@ -58,7 +57,21 @@ func main() {
 	}
 
 	interval := simulation.IntervalFromEnv()
-	simulator := simulation.New(client.WriteAPI(), simulation.DefaultSensors(), simulation.WithInterval(interval))
+	machineIterations := simulation.MachineIterationsFromEnv()
+	sensors := simulation.DefaultSensors()
+	simulator := simulation.New(
+		client.WriteAPI(),
+		sensors,
+		simulation.WithInterval(interval),
+		simulation.WithMachineIterations(machineIterations),
+	)
+
+	// Log all sensors on startup for debugging
+	log.Printf("📊 Simulator initialized with %d sensors:", len(sensors))
+	for _, sensor := range sensors {
+		log.Printf("   - Machine: '%s', Sensor: '%s', Baseline: %.2f", sensor.MachineName, sensor.SensorName, sensor.Baseline)
+	}
+
 	simulator.Start(ctx)
 
 	mysqlCfg, err := mysqlclient.FromEnv()
@@ -77,8 +90,8 @@ func main() {
 		log.Fatalf("mysql ensure schema error: %v", err)
 	}
 
-	completionService := processing.NewCompletionService(client, metadataRepo)
-	completionService.Start(ctx)
+	coordinator := simulation.NewCoordinator(simulator, metadataRepo)
+	coordinator.Start(ctx)
 
 	router := server.NewRouter(server.Dependencies{
 		Simulator: simulator,

@@ -119,6 +119,21 @@ func (c *Client) RecentSensorReadingsByMachine(ctx context.Context, measurement,
 	return c.recentSensorReadings(ctx, measurement, f, lookback, limit)
 }
 
+// RecentSensorReadingsByMachineAndSensor fetches filtered data for a specific machine and sensor.
+func (c *Client) RecentSensorReadingsByMachineAndSensor(ctx context.Context, measurement, machineName, sensorName string, lookback time.Duration, limit int) ([]SensorReading, error) {
+	if strings.TrimSpace(machineName) == "" {
+		return nil, fmt.Errorf("machine name is required")
+	}
+	if strings.TrimSpace(sensorName) == "" {
+		return nil, fmt.Errorf("sensor name is required")
+	}
+	f := map[string]string{
+		"machine_name": machineName,
+		"sensor_name":  sensorName,
+	}
+	return c.recentSensorReadings(ctx, measurement, f, lookback, limit)
+}
+
 func (c *Client) recentSensorReadings(ctx context.Context, measurement string, filters map[string]string, lookback time.Duration, limit int) ([]SensorReading, error) {
 	if measurement == "" {
 		return nil, fmt.Errorf("measurement is required")
@@ -137,6 +152,66 @@ func (c *Client) recentSensorReadings(ctx context.Context, measurement string, f
 	}
 
 	flux += "\n|> sort(columns: [\"_time\"], desc: true)"
+	if limit > 0 {
+		flux = fmt.Sprintf("%s\n|> limit(n:%d)", flux, limit)
+	}
+
+	result, err := c.QueryAPI().Query(ctx, flux)
+	if err != nil {
+		return nil, fmt.Errorf("query influx: %w", err)
+	}
+	defer result.Close()
+
+	readings := make([]SensorReading, 0, max(limit, 0))
+	for result.Next() {
+		record := result.Record()
+		value, ok := record.Value().(float64)
+		if !ok {
+			switch v := record.Value().(type) {
+			case int64:
+				value = float64(v)
+			case uint64:
+				value = float64(v)
+			default:
+				continue
+			}
+		}
+
+		readings = append(readings, SensorReading{
+			Time:        record.Time(),
+			MachineName: stringify(record.ValueByKey("machine_name")),
+			SensorName:  stringify(record.ValueByKey("sensor_name")),
+			Status:      stringify(record.ValueByKey("status")),
+			Value:       value,
+		})
+	}
+
+	if err := result.Err(); err != nil {
+		return nil, fmt.Errorf("iterate influx result: %w", err)
+	}
+
+	return readings, nil
+}
+
+// SensorReadingsSince fetches sensor values recorded after the provided start timestamp.
+func (c *Client) SensorReadingsSince(ctx context.Context, measurement string, start time.Time, filters map[string]string, limit int) ([]SensorReading, error) {
+	if measurement == "" {
+		return nil, fmt.Errorf("measurement is required")
+	}
+	if start.IsZero() {
+		start = time.Now().Add(-time.Hour)
+	}
+
+	flux := fmt.Sprintf(`from(bucket: %q)
+|> range(start: time(v: %q))
+|> filter(fn: (r) => r["_measurement"] == %q)
+|> filter(fn: (r) => r["_field"] == "value")`, c.cfg.Bucket, start.UTC().Format(time.RFC3339Nano), measurement)
+
+	for key, value := range filters {
+		flux = fmt.Sprintf("%s\n|> filter(fn: (r) => r[%q] == %s)", flux, key, fluxStringLiteral(value))
+	}
+
+	flux += "\n|> sort(columns: [\"_time\"])"
 	if limit > 0 {
 		flux = fmt.Sprintf("%s\n|> limit(n:%d)", flux, limit)
 	}

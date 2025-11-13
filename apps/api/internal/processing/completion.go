@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	defaultCompletionInterval   = time.Minute
-	defaultCompletionLookback   = 1 * time.Minute
+	defaultCompletionInterval   = 25 * time.Millisecond // Match simulator interval (was 1 minute)
+	defaultCompletionLookback   = 30 * time.Second // Increased lookback window
 	defaultSamplesPerSensor     = 3
 	defaultZeroThreshold        = 5.0
 	defaultMeasurementForStatus = "sensor_data"
@@ -23,13 +23,13 @@ const (
 
 // CompletionService watches sensor readings and marks lots complete when machines stay down.
 type CompletionService struct {
-	influx          *influxdb.Client
-	repo            *metadata.Repository
-	interval        time.Duration
-	lookback        time.Duration
-	samplesRequired int
-	zeroThreshold   float64
-	measurement     string
+	influx              *influxdb.Client
+	repo                *metadata.Repository
+	interval            time.Duration
+	lookback            time.Duration
+	samplesRequired     int
+	zeroThreshold       float64
+	measurement         string
 }
 
 // CompletionOption customises the detector.
@@ -120,33 +120,44 @@ func (s *CompletionService) Start(ctx context.Context) {
 }
 
 func (s *CompletionService) checkLots(ctx context.Context) {
+	log.Printf("[DEBUG] checkLots: starting lot completion check cycle...")
 	lots, err := s.repo.ListActiveLots(ctx)
 	if err != nil {
-		log.Printf("lot completion: list active lots failed: %v", err)
+		log.Printf("[DEBUG] checkLots: list active lots failed: %v", err)
 		return
 	}
 	if len(lots) == 0 {
+		log.Printf("[DEBUG] checkLots: no active lots found, skipping check")
 		return
 	}
 
-	for _, lot := range lots {
+	log.Printf("[DEBUG] checkLots: found %d active lot(s) to check", len(lots))
+
+	for i, lot := range lots {
+		log.Printf("[DEBUG] checkLots: [%d/%d] checking lot=%s machine=%s status=%s for sensor-down", 
+			i+1, len(lots), lot.LotNumber, lot.MachineName, lot.Status)
+
+		// Fallback to original sensor-down based completion
 		summary, done, evalErr := s.evaluateLot(ctx, lot)
 		if evalErr != nil {
-			log.Printf("lot completion: evaluate lot %s failed: %v", lot.LotNumber, evalErr)
+			log.Printf("[DEBUG] checkLots: lot=%s evaluateLot error: %v", lot.LotNumber, evalErr)
 			continue
 		}
 		if !done || summary == nil {
+			log.Printf("[DEBUG] checkLots: lot=%s sensor-down check returned done=%v (not ready for completion)", lot.LotNumber, done)
 			continue
 		}
 
+		log.Printf("[DEBUG] checkLots: lot=%s all sensors DOWN, marking as completed via sensor-down logic", lot.LotNumber)
 		if err := s.repo.MarkLotCompleted(ctx, lot.ID, *summary); err != nil {
 			if !errorsIsNoRows(err) {
-				log.Printf("lot completion: mark lot %s complete failed: %v", lot.LotNumber, err)
+				log.Printf("[DEBUG] checkLots: lot=%s MarkLotCompleted (sensor-down) error: %v", lot.LotNumber, err)
 			}
 			continue
 		}
-		log.Printf("lot completion: lot %s marked complete (machine=%s)", lot.LotNumber, lot.MachineName)
+		log.Printf("✅ lot completion: lot %s marked complete via sensor-down (machine=%s)", lot.LotNumber, lot.MachineName)
 	}
+	log.Printf("[DEBUG] checkLots: cycle completed, processed %d lot(s)", len(lots))
 }
 
 func (s *CompletionService) evaluateLot(ctx context.Context, lot metadata.Lot) (*metadata.LotSummary, bool, error) {
