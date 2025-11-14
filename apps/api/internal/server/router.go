@@ -34,7 +34,11 @@ func NewRouter(deps Dependencies) *gin.Engine {
 	r := gin.Default()
 
 	corsConfig := cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", "https://localhost:3000"},
+		AllowOrigins:     []string{
+			"http://localhost:3000",
+			"https://localhost:3000",
+			"https://minerva-ericsson.vercel.app",
+		},
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept"},
 		AllowCredentials: true,
